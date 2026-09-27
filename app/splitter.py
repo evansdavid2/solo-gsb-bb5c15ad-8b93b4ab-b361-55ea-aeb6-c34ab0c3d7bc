@@ -12,7 +12,7 @@ from fractions import Fraction
 from functools import lru_cache
 from itertools import combinations
 from math import factorial, gcd as _gcd
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def tie_key(passenger_id) -> tuple:
@@ -557,3 +557,169 @@ def _optimal_transfers(nonzero: List[Tuple]) -> List[Tuple]:
         (frm, to, amount)
         for frm, to, amount in sorted(partition(full), key=_triple)
     ]
+
+
+# --- fare envelope: min/max of one passenger's owed fare over two free
+#     segment costs bounded by integer ranges with a fixed trip total ---
+
+
+def _crt_two(r1: int, n1: int, r2: int, n2: int):
+    """Two-modulus Chinese Remainder Theorem.
+
+    Returns ``(r0, lcm)`` — the smallest non-negative solution and the
+    modulus — for ``x ≡ r1 (mod n1)`` and ``x ≡ r2 (mod n2)``, or
+    ``None`` when the congruences disagree. ``n1``/``n2`` are positive.
+    """
+    g = _gcd(n1, n2)
+    if (r2 - r1) % g != 0:
+        return None
+    lcm = n1 // g * n2
+    if n2 // g == 1:
+        return (r1 % lcm), lcm
+    # Invert n1/g modulo n2/g and lift r1 by a multiple of n1.
+    step = n1
+    t = ((r2 - r1) // g * pow(step // g, -1, n2 // g)) % (n2 // g)
+    r0 = (r1 + step * t) % lcm
+    return r0, lcm
+
+
+def fare_envelope(segment_costs: List[Optional[int]], passengers, bounds,
+                  total_cost: int, target) -> Tuple[int, List[int], int, List[int]]:
+    """Envelope of one passenger's owed fare while two segment costs vary.
+
+    Exactly two entries of ``segment_costs`` are ``None``; ``bounds`` maps
+    each such segment index to a ``(lo, hi)`` integer range (inclusive).
+    Every other entry is a fixed non-negative integer cost. The two free
+    costs plus the fixed ones must sum to ``total_cost`` exactly. All
+    resulting cost vectors are split with exactly the same cumulative
+    deficit / leftover-cent rule as :func:`split_fares`.
+
+    Rather than scanning the ranges cent by cent (they may span 10**12),
+    the search compresses by *remainder period*: write the free costs as
+    ``x = q*n_a + r`` and ``y = q'*n_b + s`` with ``n_a``/``n_b`` the
+    numbers of passengers on board the two free segments. As long as the
+    free segments stay non-negative, adding whole multiples of the
+    onboard count to a segment cost leaves every other segment's
+    allocation untouched — each on-board passenger simply receives the
+    same extra whole cents — so the whole remainder schedule (including
+    the cross-segment deficit carried *into* the second free segment and
+    the state after it) depends only on the at most ``n_a*n_b <= 144``
+    residue pairs ``(r, s)``. For each pair the total-cost constraint
+    turns into a congruence (solved with the CRT; solution step is
+    ``lcm(n_a, n_b)``), and within that one-dimensional arithmetic
+    progression the target's fare is affine with slope
+    ``[target on a]/n_a - [target on b]/n_b``, so its extrema sit at the
+    endpoints. Ties keep the lexicographically smallest cost vector.
+
+    Returns ``(min_amount, min_vector, max_amount, max_vector)`` where the
+    vectors are the fully resolved per-segment cost lists witnessing each
+    extreme. Raises ``ValueError`` for trips violating the existing trip
+    rules, an unknown target id, free segments carrying no passengers, or
+    when no feasible cost combination exists.
+    """
+    free = [i for i, cost in enumerate(segment_costs) if cost is None]
+    if len(free) != 2:
+        raise ValueError("fare-envelope requires exactly two segments with null cost")
+    a, b = free
+
+    onboard_lists = [
+        sorted(
+            (p.id for p in passengers if p.board <= i < p.alight),
+            key=tie_key,
+        )
+        for i in range(len(segment_costs))
+    ]
+    onboard_set = [set(ids) for ids in onboard_lists]
+
+    target_id = None
+    for p in passengers:
+        if str(p.id) == str(target):
+            target_id = p.id
+            break
+    if target_id is None:
+        raise ValueError(f"unknown target passenger id: {target!r} (no such passenger in the trip)")
+
+    # Existing trip rules: fixed segments must not charge an empty load
+    # (zero-cost empty segments stay allowed), and both free segments
+    # must carry passengers — their ranges include no feasible value
+    # otherwise, and the remainder period would be undefined.
+    for i, cost in enumerate(segment_costs):
+        if cost is None:
+            if not onboard_lists[i]:
+                raise ValueError(
+                    f"segment {i} has an undetermined cost but no passengers "
+                    f"on board (free segments must be occupied)"
+                )
+            continue
+        if cost > 0 and not onboard_lists[i]:
+            raise ValueError(
+                f"segment {i} has cost {cost} but no passengers on board "
+                f"(empty-load charged segment)"
+            )
+
+    lo_a, hi_a = bounds[a]
+    lo_b, hi_b = bounds[b]
+    n_a, n_b = len(onboard_lists[a]), len(onboard_lists[b])
+    fixed_sum = sum(cost for cost in segment_costs if cost is not None)
+    remaining = total_cost - fixed_sum  # = x + y for every feasible vector
+    if remaining < 0:
+        raise ValueError("no feasible fare combination: fixed segments already "
+                         "cost more than the trip total")
+
+    x_min = max(lo_a, remaining - hi_b)
+    x_max = min(hi_a, remaining - lo_b)
+
+    best_min = None  # (amount, vector)
+    best_max = None  # (amount, vector)
+
+    def vector_for(x: int, y: int) -> List[int]:
+        vec = list(segment_costs)
+        vec[a], vec[b] = x, y
+        return vec
+
+    def consider(x: int, y: int) -> None:
+        vec = vector_for(x, y)
+        totals, _ = split_fares(vec, passengers)
+        amount = totals[target_id]
+        nonlocal best_min, best_max
+        if best_min is None or amount < best_min[0] or (
+            amount == best_min[0] and vec < best_min[1]
+        ):
+            best_min = (amount, vec)
+        if best_max is None or amount > best_max[0] or (
+            amount == best_max[0] and vec < best_max[1]
+        ):
+            best_max = (amount, vec)
+
+    for r in range(n_a):
+        for s in range(n_b):
+            # x ≡ r (mod n_a), y ≡ s (mod n_b), x + y = remaining.
+            crt = _crt_two(r, n_a, (remaining - s) % n_b, n_b)
+            if crt is None:
+                continue
+            r0, period = crt
+            if x_min > x_max or r0 > x_max:
+                continue
+            x_first = r0 if r0 >= x_min else r0 + ((x_min - r0 + period - 1) // period) * period
+            if x_first > x_max:
+                continue
+            count = (x_max - x_first) // period
+            x_last = x_first + count * period
+
+            # The target's fare over this residue class is
+            # A(r, s) + x * on_a/n_a + (remaining - x) * on_b/n_b,
+            # an affine function of x alone; hence only the endpoints
+            # (the smallest and largest feasible x) can be extrema.
+            consider(x_first, remaining - x_first)
+            if x_last != x_first:
+                consider(x_last, remaining - x_last)
+
+    if best_min is None:
+        raise ValueError(
+            "no feasible fare combination satisfies both integer ranges and "
+            "the trip total"
+        )
+
+    # The affine slope is constant across residue classes and included in
+    # the evaluated endpoints above, so cross-class comparisons are exact.
+    return best_min[0], best_min[1], best_max[0], best_max[1]

@@ -3,8 +3,10 @@
 基于 FastAPI 的拼车费用分摊服务：按顺序路段读取整数分费用与每位乘客的上下车站点，
 逐段均摊费用，输出逐人总额与逐路段明细；还可从最多 12 名候选乘客中**自动遴选**一组
 上车（座位与预算双约束，先求入选人数最多、再求入选者应付总额最小）；在提供每人
-实际付款记录后，自动生成**转账笔数全局最少**的结清方案；以及在路段费用修订后，
-按所有修订应用顺序计算每个变动路段对每人应付额的**平均边际影响（Shapley 归因）**。
+实际付款记录后，自动生成**转账笔数全局最少**的结清方案；在路段费用修订后，
+按所有修订应用顺序计算每个变动路段对每人应付额的**平均边际影响（Shapley 归因）**；
+以及在恰有两段费用未定（各给整数分上下界）、全程总价固定时，给出目标乘客应付额的
+**精确最小值 / 最大值及完整路段费用见证**（`POST /fare-envelope`）。
 金额全程使用整数分与精确分数计算，总额严格守恒，且乘客与付款记录的输入顺序不影响结果。
 
 ## 快速启动
@@ -23,10 +25,11 @@ docker compose up --build
 | http://localhost:8000/admit | 候选乘客遴选 + 分摊接口（POST） |
 | http://localhost:8000/settle | 分摊 + 结清转账接口（POST） |
 | http://localhost:8000/revision-impact | 路段费用修订的边际影响归因接口（POST） |
+| http://localhost:8000/fare-envelope | 两段费用待定时目标乘客应付额的最小/最大包络（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档（各 POST 接口可在此直接发请求） |
 | http://localhost:8000/healthz | 健康检查 |
 
-以上 `/split`、`/admit`、`/settle`、`/revision-impact` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
+以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
 
 后台运行可加 `-d`；停止用 `docker compose down`。
 
@@ -301,6 +304,92 @@ curl -s http://localhost:8000/revision-impact \
   -d '{"segments":[100,251,80],"revised_segments":[120,240,90],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}]}'
 ```
 
+## API：`POST /fare-envelope`
+
+沿用 `/split` 的乘客上下车结构，但 `segments` 中**恰有两段费用为 `null`**（待定路段）。
+为这两段分别给出**整数分上下界**，再给出全程总价 `total_cost` 与目标乘客 `target`；
+其余路段费用固定。接口枚举所有满足：
+
+1. 两段费用均在各自闭区间内（非负整数，**金额与上界不超过 10¹² 分**）；
+2. 全部路段费用之和**恰好等于** `total_cost`；
+
+的费用组合，对每个组合复用 `/split` 的「累计欠分 + 余分」分摊规则，返回目标乘客应付额的
+**精确最小值、最大值**，以及取到各极值时的**完整路段费用见证向量**（无 `null`，求和恒等于
+`total_cost`）。同一极值对应多个费用向量时，取**费用向量字典序最小**者。
+
+- 至多 **100 段**、**12 名乘客**；两段待定路段**都必须有乘客在车**（否则 422）；
+- 固定路段仍须满足 `/split` 全部既有行程规则（正费用空载段非法、零费用空载段允许）；
+- 不存在满足区间与总价的组合、`target` 不是车上乘客、或违反既有行程规则时返回 **422**。
+
+### 余数周期压缩（不逐分遍历区间）
+
+设两段待定路段为 `a`、`b`，在车人数分别为 `n_a`、`n_b`。把费用写成
+`x = q·n_a + r`（`0 ≤ r < n_a`）、`y = q'·n_b + s`（`0 ≤ s < n_b`）。当某段费用在其
+余数不变的前提下整体增减「在车人数的整数倍」时：
+
+- 该段每位在车乘客只是**同等多地多收整分**，本段余数归属不变；
+- 该段之后所有乘客的欠分状态**逐分相同**，因此第二段余分补给谁（含跨段携带的欠分）、
+  以及第二段之后所有固定路段的分摊都**完全不变**。
+
+所以目标乘客的应付额只取决于至多 `n_a·n_b ≤ 144` 个余数对 `(r, s)`。对每个余数对，
+约束 `x + y = total_cost − 固定段之和` 变成一个二元同余方程组
+（`x ≡ r (mod n_a)`、`x ≡ remaining − s (mod n_b)`），用中国剩余定理判定相容并得到
+步长 `lcm(n_a, n_b)` 的等差可行序列；序列内目标乘客应付额关于 `x` 是仿射函数，
+斜率为「目标是否在 a 段 / n_a − 目标是否在 b 段 / n_b」，故每个余数对只需评估
+**序列两端**即可取到该余数类上的最小/最大值，再跨余数类比较。全程精确分数，
+10¹² 量级区间也在毫秒内完成；跨段欠分影响由「余数对固定即整段下游分摊固定」自动保留。
+
+### 请求体
+
+```json
+{
+  "segments": [null, 5, null],
+  "passengers": [
+    {"id": "alice", "board": 0, "alight": 3},
+    {"id": "bob",   "board": 1, "alight": 2},
+    {"id": "carol", "board": 0, "alight": 1}
+  ],
+  "bounds": [
+    {"index": 0, "min_cost": 0, "max_cost": 10},
+    {"index": 2, "min_cost": 0, "max_cost": 10}
+  ],
+  "total_cost": 15,
+  "target": "alice"
+}
+```
+
+- `segments`：按行程顺序的路段费用，与 `/split` 相同，但**恰有两个元素为 `null`**。
+- `bounds`：每个待定路段一条，`index` 必须指向某个 `null` 段，`min_cost ≤ max_cost`，
+  均为非负整数且不超过 10¹² 分。
+- `total_cost`：全程总价（非负整数，≤ 10¹² 分），任何可行组合的费用和都必须恰好等于它。
+- `target`：目标乘客 ID（字符串或整数，须存在于 `passengers`）。
+
+### 响应（200）
+
+```json
+{
+  "target": "alice",
+  "total_cost": 15,
+  "minimum": {"amount": 8,  "segments": [9, 5, 1]},
+  "maximum": {"amount": 13, "segments": [0, 5, 10]}
+}
+```
+
+上例 `x + y = 10`，alice 在 11 个可行组合上的应付额依次为
+`13,12,12,11,11,10,10,9,9,8,8`：最小 8 由两个向量同时取到（`x=9` 与 `x=10`），
+取字典序更小的 `[9,5,1]`；最大 13 仅 `[0,5,10]` 取到。
+注意只乘坐中间固定段的 bob：该段 5 分 / 2 人的余分归属取决于 alice 从第 0 段
+**携带进来的欠分**，因此 bob 的应付额会随 `x` 的奇偶在 2 与 3 之间变化
+（`minimum = [0,5,10] → 2`，`maximum = [1,5,9] → 3`），跨段欠分影响被完整保留。
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/fare-envelope \
+  -H 'Content-Type: application/json' \
+  -d '{"segments":[null,5,null],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":2},{"id":"carol","board":0,"alight":1}],"bounds":[{"index":0,"min_cost":0,"max_cost":10},{"index":2,"min_cost":0,"max_cost":10}],"total_cost":15,"target":"alice"}'
+```
+
 ## 分摊规则
 
 1. 按路段顺序处理，每段找出全部在车乘客均摊：`base = cost // n`，余数 `r = cost % n`。
@@ -323,7 +412,13 @@ curl -s http://localhost:8000/revision-impact \
 - （仅 `/settle`）`payments` 缺失某位乘客、存在未知 ID 或同一 ID 重复；
 - （仅 `/settle`）付款金额为负或非整数（如小数）；
 - （仅 `/revision-impact`）`segments` 与 `revised_segments` 长度不等；
-- （仅 `/revision-impact`）费用发生变化的路段超过 8 个（归因需枚举全部 2^n 个子集）。
+- （仅 `/revision-impact`）费用发生变化的路段超过 8 个（归因需枚举全部 2^n 个子集）；
+- （仅 `/fare-envelope`）`segments` 中 `null` 不是恰有两个；`bounds` 不是恰两条、
+  指向了非 `null` 段、段号重复或 `min_cost > max_cost`；
+- （仅 `/fare-envelope`）待定路段上没有任何乘客在车；
+- （仅 `/fare-envelope`）`target` 不是车上乘客；
+- （仅 `/fare-envelope`）没有任何费用组合同时满足两段整数区间与 `total_cost`；
+- （仅 `/fare-envelope`）路段超过 100 段、乘客超过 12 人，或费用/上界/总价超过 10¹² 分。
 
 ## 本地开发与测试
 
@@ -339,9 +434,9 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
-  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）
+  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期/CRT 压缩搜索）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查

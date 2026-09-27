@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from .models import (
     AdmitRequest,
     AdmitResponse,
+    FareEnvelopeRequest,
+    FareEnvelopeResponse,
+    FareExtreme,
     RevisionImpactRequest,
     RevisionImpactResponse,
     SegmentContribution,
@@ -19,6 +22,7 @@ from .models import (
 )
 from .splitter import (
     admit_passengers,
+    fare_envelope,
     revision_impact as compute_revision_impact,
     settle_balances,
     split_fares,
@@ -150,4 +154,35 @@ def revision_impact(request: RevisionImpactRequest) -> RevisionImpactResponse:
             )
             for c in changes
         ],
+    )
+
+
+@app.post(
+    "/fare-envelope",
+    response_model=FareEnvelopeResponse,
+    responses={422: {"description": "Invalid trip or envelope (bad interval, "
+                                     "out-of-range station, duplicate id, "
+                                     "empty-load charged fixed segment, a free "
+                                     "segment with no passengers on board, wrong "
+                                     "number of null segments/bounds, unknown "
+                                     "target id, bounds or total over 10^12 "
+                                     "cents, no feasible cost combination, "
+                                     "malformed payload, ...)"}},
+)
+def fare_envelope_endpoint(request: FareEnvelopeRequest) -> FareEnvelopeResponse:
+    bounds = {b.index: (b.min_cost, b.max_cost) for b in request.bounds}
+    try:
+        min_amount, min_vector, max_amount, max_vector = fare_envelope(
+            request.segments, request.passengers, bounds,
+            request.total_cost, request.target,
+        )
+    except ValueError as exc:
+        # Domain failures (e.g. no feasible combination) are 422 like the
+        # validator-raised errors on the other endpoints.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return FareEnvelopeResponse(
+        target=request.target,
+        total_cost=request.total_cost,
+        minimum=FareExtreme(amount=min_amount, segments=min_vector),
+        maximum=FareExtreme(amount=max_amount, segments=max_vector),
     )

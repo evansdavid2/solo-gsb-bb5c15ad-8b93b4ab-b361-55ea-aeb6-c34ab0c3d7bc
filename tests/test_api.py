@@ -667,5 +667,226 @@ class RevisionImpactApiTests(unittest.TestCase):
             self.assertEqual(resp.json(), baseline)
 
 
+class FareEnvelopeApiTests(unittest.TestCase):
+    ENVELOPE_PAYLOAD = {
+        "segments": [None, 5, None],
+        "passengers": [
+            {"id": "alice", "board": 0, "alight": 3},
+            {"id": "bob",   "board": 1, "alight": 2},
+            {"id": "carol", "board": 0, "alight": 1},
+        ],
+        "bounds": [
+            {"index": 0, "min_cost": 0, "max_cost": 10},
+            {"index": 2, "min_cost": 0, "max_cost": 10},
+        ],
+        "total_cost": 15,
+        "target": "alice",
+    }
+
+    def test_envelope_ok(self):
+        resp = client.post("/fare-envelope", json=self.ENVELOPE_PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["target"], "alice")
+        self.assertEqual(body["total_cost"], 15)
+        # brute table for alice over x+y=10, x in 0..10:
+        # 13,12,12,11,11,10,10,9,9,8,8
+        self.assertEqual(body["minimum"]["amount"], 8)
+        self.assertEqual(body["minimum"]["segments"], [9, 5, 1])
+        self.assertEqual(body["maximum"]["amount"], 13)
+        self.assertEqual(body["maximum"]["segments"], [0, 5, 10])
+        for extreme in (body["minimum"], body["maximum"]):
+            self.assertEqual(sum(extreme["segments"]), 15)
+            self.assertNotIn(None, extreme["segments"])
+            # each witness reproduces its amount under /split
+            check = client.post("/split", json={
+                "segments": extreme["segments"],
+                "passengers": self.ENVELOPE_PAYLOAD["passengers"],
+            })
+            self.assertEqual(check.status_code, 200)
+            self.assertEqual(check.json()["totals"]["alice"], extreme["amount"])
+
+    def test_target_bob_cross_segment_deficit(self):
+        payload = dict(self.ENVELOPE_PAYLOAD, target="bob")
+        body = client.post("/fare-envelope", json=payload).json()
+        self.assertEqual(body["minimum"]["amount"], 2)
+        self.assertEqual(body["minimum"]["segments"], [0, 5, 10])
+        self.assertEqual(body["maximum"]["amount"], 3)
+        self.assertEqual(body["maximum"]["segments"], [1, 5, 9])
+
+    def test_huge_bounds_do_not_scan_cent_by_cent(self):
+        big = 10**12
+        payload = {
+            "segments": [None, None, 0],
+            "passengers": self.ENVELOPE_PAYLOAD["passengers"],
+            "bounds": [
+                {"index": 0, "min_cost": 0, "max_cost": big},
+                {"index": 1, "min_cost": 0, "max_cost": big},
+            ],
+            "total_cost": big,
+            "target": "bob",
+        }
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["minimum"]["amount"], 0)
+        self.assertEqual(body["maximum"]["amount"], big // 2)
+        self.assertEqual(sum(body["minimum"]["segments"]), big)
+
+    def test_no_feasible_combination_is_422(self):
+        payload = dict(self.ENVELOPE_PAYLOAD,
+                       bounds=[{"index": 0, "min_cost": 0, "max_cost": 3},
+                               {"index": 2, "min_cost": 0, "max_cost": 3}])
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no feasible fare combination", resp.text)
+
+    def test_fixed_segments_exceed_total_is_422(self):
+        payload = dict(self.ENVELOPE_PAYLOAD,
+                       segments=[None, 50, None], total_cost=15)
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no feasible fare combination", resp.text)
+
+    def test_unknown_target_is_422(self):
+        payload = dict(self.ENVELOPE_PAYLOAD, target="nobody")
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("unknown target passenger id", resp.text)
+
+    def test_free_segment_without_passengers_is_422(self):
+        # carol rides seg0; seg1 and seg2 free/empty
+        payload = {
+            "segments": [0, None, None],
+            "passengers": [{"id": "carol", "board": 0, "alight": 1}],
+            "bounds": [{"index": 1, "min_cost": 0, "max_cost": 5},
+                       {"index": 2, "min_cost": 0, "max_cost": 5}],
+            "total_cost": 5,
+            "target": "carol",
+        }
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("undetermined cost but no passengers", resp.text)
+
+    def test_empty_load_charged_fixed_segment_is_422(self):
+        # a rides both free segments (0 and 2); the fixed segment 1 is
+        # charged but empty, which violates the existing trip rules.
+        payload = dict(self.ENVELOPE_PAYLOAD,
+                       segments=[None, 7, None],
+                       passengers=[{"id": "a", "board": 0, "alight": 1},
+                                   {"id": "z", "board": 2, "alight": 3}],
+                       target="a")
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no passengers on board", resp.text)
+
+    def test_bad_interval_and_duplicate_ids_are_422(self):
+        bad = dict(self.ENVELOPE_PAYLOAD,
+                   passengers=[{"id": "a", "board": 2, "alight": 2}])
+        self.assertEqual(client.post("/fare-envelope", json=bad).status_code, 422)
+        dup = dict(self.ENVELOPE_PAYLOAD, passengers=[
+            {"id": "a", "board": 0, "alight": 3},
+            {"id": "a", "board": 0, "alight": 3},
+        ])
+        self.assertEqual(client.post("/fare-envelope", json=dup).status_code, 422)
+
+    def test_wrong_null_count_is_422(self):
+        one_null = dict(self.ENVELOPE_PAYLOAD, segments=[None, 5, 5])
+        resp = client.post("/fare-envelope", json=one_null)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("exactly two null", resp.text)
+
+        three_null = dict(self.ENVELOPE_PAYLOAD,
+                          segments=[None, None, None])
+        resp = client.post("/fare-envelope", json=three_null)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_wrong_bounds_entries_are_422(self):
+        # one bound instead of two
+        one = dict(self.ENVELOPE_PAYLOAD,
+                   bounds=[{"index": 0, "min_cost": 0, "max_cost": 10}])
+        self.assertEqual(client.post("/fare-envelope", json=one).status_code, 422)
+        # bound references a fixed segment
+        wrong = dict(self.ENVELOPE_PAYLOAD,
+                     bounds=[{"index": 0, "min_cost": 0, "max_cost": 10},
+                             {"index": 1, "min_cost": 0, "max_cost": 10}])
+        self.assertEqual(client.post("/fare-envelope", json=wrong).status_code, 422)
+        # duplicated bound index
+        dup = dict(self.ENVELOPE_PAYLOAD,
+                   bounds=[{"index": 0, "min_cost": 0, "max_cost": 10},
+                           {"index": 0, "min_cost": 0, "max_cost": 10}])
+        self.assertEqual(client.post("/fare-envelope", json=dup).status_code, 422)
+        # inverted range
+        inverted = dict(self.ENVELOPE_PAYLOAD,
+                        bounds=[{"index": 0, "min_cost": 9, "max_cost": 2},
+                                {"index": 2, "min_cost": 0, "max_cost": 10}])
+        self.assertEqual(client.post("/fare-envelope", json=inverted).status_code, 422)
+
+    def test_limits_and_unknown_fields_are_422(self):
+        big = 10**12 + 1
+        too_big_cost = dict(self.ENVELOPE_PAYLOAD,
+                            segments=[None, big, None])
+        self.assertEqual(
+            client.post("/fare-envelope", json=too_big_cost).status_code, 422
+        )
+        too_big_bound = dict(
+            self.ENVELOPE_PAYLOAD,
+            bounds=[{"index": 0, "min_cost": 0, "max_cost": big},
+                    {"index": 2, "min_cost": 0, "max_cost": 10}],
+        )
+        self.assertEqual(
+            client.post("/fare-envelope", json=too_big_bound).status_code, 422
+        )
+        too_big_total = dict(self.ENVELOPE_PAYLOAD, total_cost=big)
+        self.assertEqual(
+            client.post("/fare-envelope", json=too_big_total).status_code, 422
+        )
+        unknown = dict(self.ENVELOPE_PAYLOAD, currency="usd")
+        self.assertEqual(
+            client.post("/fare-envelope", json=unknown).status_code, 422
+        )
+
+    def test_more_than_12_passengers_is_422(self):
+        pax = [{"id": f"p{i}", "board": 0, "alight": 3} for i in range(13)]
+        payload = {
+            "segments": [None, 5, None],
+            "passengers": pax,
+            "bounds": [{"index": 0, "min_cost": 0, "max_cost": 10},
+                       {"index": 2, "min_cost": 0, "max_cost": 10}],
+            "total_cost": 15,
+            "target": "p0",
+        }
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_more_than_100_segments_is_422(self):
+        n = 101
+        segments = [0] * n
+        segments[0] = segments[50] = None
+        payload = {
+            "segments": segments,
+            "passengers": [{"id": "a", "board": 0, "alight": n}],
+            "bounds": [{"index": 0, "min_cost": 0, "max_cost": 10},
+                       {"index": 50, "min_cost": 0, "max_cost": 10}],
+            "total_cost": 10,
+            "target": "a",
+        }
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_passenger_order_does_not_matter(self):
+        import random
+        baseline = client.post(
+            "/fare-envelope", json=self.ENVELOPE_PAYLOAD
+        ).json()
+        for seed in range(5):
+            shuffled = dict(self.ENVELOPE_PAYLOAD,
+                            passengers=self.ENVELOPE_PAYLOAD["passengers"][:])
+            random.Random(seed).shuffle(shuffled["passengers"])
+            resp = client.post("/fare-envelope", json=shuffled)
+            self.assertEqual(resp.status_code, 200, resp.text)
+            self.assertEqual(resp.json(), baseline)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,8 +12,10 @@ from math import factorial
 from types import SimpleNamespace as P
 
 from app.splitter import (
+    _crt_two,
     _triple,
     admit_passengers,
+    fare_envelope,
     revision_impact,
     settle_balances,
     split_fares,
@@ -568,6 +570,190 @@ class SettleOptimalityPropertyTests(unittest.TestCase):
                 net[to] += amount
             self.assertEqual(net, balances)
             self.assertEqual(transfers, sorted(transfers, key=_triple))
+
+
+class CrtTwoTests(unittest.TestCase):
+    def test_consistent_residues(self):
+        # x ≡ 1 (mod 2), x ≡ 2 (mod 3): solutions 5, 11, ...
+        self.assertEqual(_crt_two(1, 2, 2, 3), (5, 6))
+        # x ≡ 0 (mod 4), x ≡ 0 (mod 6): solutions 0, 12, ...
+        self.assertEqual(_crt_two(0, 4, 0, 6), (0, 12))
+        # modulus 1 degenerates to the other congruence
+        self.assertEqual(_crt_two(0, 1, 3, 7), (3, 7))
+
+    def test_inconsistent_residues(self):
+        # x ≡ 0 (mod 2) and x ≡ 1 (mod 4) can never hold together
+        self.assertIsNone(_crt_two(0, 2, 1, 4))
+        self.assertIsNone(_crt_two(1, 6, 0, 4))
+
+
+class FareEnvelopeTests(unittest.TestCase):
+    # seg0 free (a,c on board), seg1 fixed 5 (a,b), seg2 free (a alone)
+    PAX = [ride("a", 0, 3), ride("b", 1, 2), ride("c", 0, 1)]
+
+    def test_hand_computed_extrema(self):
+        # x + y = 10 over x,y in [0,10]: brute table for 'a' is
+        # x=0..10 -> 13,12,12,11,11,10,10,9,9,8,8
+        mn, min_vec, mx, max_vec = fare_envelope(
+            [None, 5, None], self.PAX, {0: (0, 10), 2: (0, 10)}, 15, "a"
+        )
+        self.assertEqual((mn, mx), (8, 13))
+        self.assertEqual(max_vec, [0, 5, 10])
+        # amount 8 is a tie between x=9 and x=10: keep the lex-smaller vector
+        self.assertEqual(min_vec, [9, 5, 1])
+
+    def test_witness_sums_to_total_and_matches_split(self):
+        mn, min_vec, mx, max_vec = fare_envelope(
+            [None, 5, None], self.PAX, {0: (2, 8), 2: (1, 9)}, 15, "c"
+        )
+        for amount, vec in ((mn, min_vec), (mx, max_vec)):
+            self.assertEqual(sum(vec), 15)
+            self.assertIsNone(next((c for c in vec if c is None), None))
+            totals, _ = split_fares(vec, self.PAX)
+            self.assertEqual(totals["c"], amount)
+
+    def test_cross_segment_deficit_changes_fixed_segment_share(self):
+        # b rides only the fixed seg1 (cost 5, 2 on board): its single
+        # leftover cent follows the deficit alice carries *into* seg1
+        # from the free seg0, so b's fare alternates 2 (even x) / 3
+        # (odd x). The envelope must preserve that cross-segment effect.
+        mn, min_vec, mx, max_vec = fare_envelope(
+            [None, 5, None], self.PAX, {0: (0, 10), 2: (0, 10)}, 15, "b"
+        )
+        self.assertEqual((mn, mx), (2, 3))
+        self.assertEqual(split_fares(min_vec, self.PAX)[0]["b"], 2)
+        self.assertEqual(split_fares(max_vec, self.PAX)[0]["b"], 3)
+        self.assertEqual(min_vec, [0, 5, 10])  # smallest even x: b gets 2
+        self.assertEqual(max_vec, [1, 5, 9])   # smallest odd x: b gets 3
+
+    def test_large_bounds_use_remainder_period_not_cent_scan(self):
+        # 10**12-wide ranges must resolve instantly; a rides both free
+        # segments and always owes exactly half of the total there.
+        big = 10**12
+        mn, min_vec, mx, max_vec = fare_envelope(
+            [None, None, 0], self.PAX, {0: (0, big), 1: (0, big)}, big, "a"
+        )
+        self.assertEqual((mn, mx), (big // 2, big // 2))
+        # constant amount: the lex-smallest feasible vector witnesses both
+        self.assertEqual(min_vec, [0, big, 0])
+        self.assertEqual(max_vec, [0, big, 0])
+
+        # non-constant case over the same range: b only rides seg1, so b's
+        # fare ranges 0..big/2 across the feasible vectors
+        mn_b, min_b, mx_b, max_b = fare_envelope(
+            [None, None, 0], self.PAX, {0: (0, big), 1: (0, big)}, big, "b"
+        )
+        self.assertEqual((mn_b, mx_b), (0, big // 2))
+        self.assertEqual(split_fares(min_b, self.PAX)[0]["b"], 0)
+        self.assertEqual(split_fares(max_b, self.PAX)[0]["b"], big // 2)
+
+    def test_lcm_period_larger_than_either_onboard_count(self):
+        # free seg0 carries {a,b} (n=2), free seg2 carries {a,d} (n=3):
+        # CRT period lcm(2,3)=6 with residues crossing each other.
+        pax = [ride("a", 0, 3), ride("b", 0, 1), ride("d", 2, 3)]
+        big = 10**12
+        mn, min_vec, mx, max_vec = fare_envelope(
+            [None, 0, None], pax, {0: (0, big), 2: (0, big)}, big + 1, "a"
+        )
+        self.assertEqual(sum(min_vec), big + 1)
+        self.assertEqual(sum(max_vec), big + 1)
+        self.assertEqual(split_fares(min_vec, pax)[0]["a"], mn)
+        self.assertEqual(split_fares(max_vec, pax)[0]["a"], mx)
+        self.assertLessEqual(mn, mx)
+
+    def test_no_feasible_combination_is_value_error(self):
+        # x + y must be 10, but bounds only allow x+y <= 6
+        with self.assertRaises(ValueError):
+            fare_envelope(
+                [None, 5, None], self.PAX, {0: (0, 3), 2: (0, 3)}, 15, "a"
+            )
+        # fixed segments already cost more than the total
+        with self.assertRaises(ValueError):
+            fare_envelope(
+                [None, 50, None], self.PAX, {0: (0, 3), 2: (0, 3)}, 15, "a"
+            )
+
+    def test_unknown_target_is_value_error(self):
+        with self.assertRaises(ValueError):
+            fare_envelope(
+                [None, 5, None], self.PAX, {0: (0, 10), 2: (0, 10)}, 15, "zzz"
+            )
+
+    def test_free_segment_without_passengers_is_value_error(self):
+        # seg0 carries nobody (a boards at 1); a free seg must be occupied
+        pax = [ride("a", 1, 3)]
+        with self.assertRaises(ValueError):
+            fare_envelope(
+                [None, 5, None], pax, {0: (0, 10), 2: (0, 10)}, 15, "a"
+            )
+
+    def test_empty_load_charged_fixed_segment_is_value_error(self):
+        pax = [ride("a", 1, 3)]  # seg0 empty, seg2 empty
+        with self.assertRaises(ValueError):
+            fare_envelope(
+                [None, 5, 7], pax, {0: (0, 10), 2: (0, 10)}, 22, "a"
+            )
+
+    def test_wrong_number_of_free_segments_is_value_error(self):
+        with self.assertRaises(ValueError):
+            fare_envelope(
+                [5, 5, None], self.PAX, {2: (0, 10)}, 15, "a"
+            )
+
+    def test_integer_target_id_matches_string_request(self):
+        pax = [ride(7, 0, 3), ride("b", 1, 2), ride("c", 0, 1)]
+        mn, min_vec, mx, max_vec = fare_envelope(
+            [None, 5, None], pax, {0: (0, 10), 2: (0, 10)}, 15, 7
+        )
+        self.assertEqual(split_fares(min_vec, pax)[0][7], mn)
+        self.assertEqual(split_fares(max_vec, pax)[0][7], mx)
+
+    def test_matches_brute_force_randomized(self):
+        import random
+        rng = random.Random(20260927)
+
+        def brute(costs, bounds, total, target):
+            (la, ha) = bounds[0]
+            (lb, hb) = bounds[2]
+            fixed = costs[1]
+            best_lo = best_hi = None
+            for x in range(la, ha + 1):
+                y = total - fixed - x
+                if not (lb <= y <= hb):
+                    continue
+                vec = [x, fixed, y]
+                amount = split_fares(vec, self.PAX)[0][target]
+                if best_lo is None or amount < best_lo[0] or (
+                    amount == best_lo[0] and vec < best_lo[1]
+                ):
+                    best_lo = (amount, vec)
+                if best_hi is None or amount > best_hi[0] or (
+                    amount == best_hi[0] and vec < best_hi[1]
+                ):
+                    best_hi = (amount, vec)
+            return best_lo, best_hi
+
+        for _ in range(120):
+            lo0, hi0 = rng.randint(0, 6), rng.randint(6, 16)
+            lo2, hi2 = rng.randint(0, 6), rng.randint(6, 16)
+            fixed = rng.randint(0, 9)
+            total = fixed + rng.randint(0, 30)
+            target = rng.choice(["a", "b", "c"])
+            bounds = {0: (lo0, hi0), 2: (lo2, hi2)}
+            expected = brute(
+                [None, fixed, None], bounds, total, target
+            )
+            try:
+                result = fare_envelope(
+                    [None, fixed, None], self.PAX, bounds, total, target
+                )
+            except ValueError:
+                self.assertIsNone(expected[0])
+                continue
+            self.assertEqual(
+                result,
+                (expected[0][0], expected[0][1], expected[1][0], expected[1][1]),
+            )
 
 
 if __name__ == "__main__":

@@ -8,11 +8,17 @@ uniform HTTP 422 response.
 
 from __future__ import annotations
 
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveInt, model_validator
 
 PassengerId = Union[str, int]
+
+# At most 100 segments / 12 passengers; every money amount (segment costs,
+# integer bounds and the trip total) is at most 10**12 cents.
+MAX_CENTS = 10**12
+MAX_ENVELOPE_SEGMENTS = 100
+MAX_PASSENGERS = 12
 
 
 class Passenger(BaseModel):
@@ -330,4 +336,125 @@ class RevisionImpactResponse(BaseModel):
     changes: List[SegmentContribution] = Field(
         description="one entry per segment whose cost changed, ordered by index; "
                     "empty when nothing changed"
+    )
+
+
+class UnknownSegmentBounds(BaseModel):
+    """Integer-cents range for one undetermined (null) segment cost."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: NonNegativeInt = Field(
+        description="index of a segment whose cost is null in `segments`"
+    )
+    min_cost: NonNegativeInt = Field(
+        le=MAX_CENTS,
+        description="inclusive integer lower bound for the segment cost, in cents",
+    )
+    max_cost: NonNegativeInt = Field(
+        le=MAX_CENTS,
+        description="inclusive integer upper bound for the segment cost, in cents",
+    )
+
+
+class FareEnvelopeRequest(BaseModel):
+    """A trip where exactly two segment costs are free within integer ranges."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segments: List[Optional[NonNegativeInt]] = Field(
+        min_length=2,
+        max_length=MAX_ENVELOPE_SEGMENTS,
+        description="per-segment costs in cents, in travel order; exactly two "
+                    "entries must be null (the undetermined segments)",
+    )
+    passengers: List[Passenger] = Field(
+        default_factory=list,
+        description="the same board/alight roster structure as /split",
+    )
+    bounds: List[UnknownSegmentBounds] = Field(
+        description="exactly one inclusive [min_cost, max_cost] integer range "
+                    "for each null segment",
+    )
+    total_cost: NonNegativeInt = Field(
+        le=MAX_CENTS,
+        description="exact whole-trip total in cents that the resolved segment "
+                    "costs must sum to",
+    )
+    target: PassengerId = Field(
+        description="id of the passenger whose owed-fare envelope is reported",
+    )
+
+    @model_validator(mode="after")
+    def _check_envelope(self) -> "FareEnvelopeRequest":
+        n = len(self.segments)
+        free = [i for i, cost in enumerate(self.segments) if cost is None]
+        if len(free) != 2:
+            raise ValueError(
+                f"segments must contain exactly two null costs, found {len(free)}"
+            )
+        for cost in self.segments:
+            if cost is not None and cost > MAX_CENTS:
+                raise ValueError(
+                    f"segment cost {cost} exceeds the {MAX_CENTS}-cents limit"
+                )
+        if len(self.passengers) > MAX_PASSENGERS:
+            raise ValueError(
+                f"at most {MAX_PASSENGERS} passengers are supported, "
+                f"found {len(self.passengers)}"
+            )
+        _validate_roster(n, self.passengers)
+
+        free_set = set(free)
+        if len(self.bounds) != 2:
+            raise ValueError(
+                f"bounds must contain exactly two entries (one per null "
+                f"segment), found {len(self.bounds)}"
+            )
+        seen = set()
+        for bound in self.bounds:
+            if bound.index not in free_set:
+                raise ValueError(
+                    f"bounds entry references segment {bound.index}, which is "
+                    f"not a null-cost segment (null segments: "
+                    f"{sorted(free_set)})"
+                )
+            if bound.index in seen:
+                raise ValueError(
+                    f"duplicate bounds entry for segment {bound.index}"
+                )
+            seen.add(bound.index)
+            if bound.min_cost > bound.max_cost:
+                raise ValueError(
+                    f"segment {bound.index} bounds are inverted: "
+                    f"min_cost {bound.min_cost} > max_cost {bound.max_cost}"
+                )
+        if not any(str(p.id) == str(self.target) for p in self.passengers):
+            raise ValueError(
+                f"unknown target passenger id: {self.target!r} "
+                f"(no such passenger in the trip)"
+            )
+        return self
+
+
+class FareExtreme(BaseModel):
+    """One envelope extreme and the full cost vector witnessing it."""
+
+    amount: NonNegativeInt = Field(
+        description="cents owed by the target passenger at this extreme"
+    )
+    segments: List[NonNegativeInt] = Field(
+        description="complete resolved per-segment cost vector (no nulls) "
+                    "witnessing this amount; sums to total_cost"
+    )
+
+
+class FareEnvelopeResponse(BaseModel):
+    target: PassengerId = Field(description="the target passenger id (as requested)")
+    total_cost: NonNegativeInt = Field(description="the exact whole-trip total in cents")
+    minimum: FareExtreme = Field(
+        description="exact minimum amount the target can owe, with a witness"
+    )
+    maximum: FareExtreme = Field(
+        description="exact maximum amount the target can owe, with a witness"
     )
