@@ -14,6 +14,7 @@ from types import SimpleNamespace as P
 from app.splitter import (
     _triple,
     admit_passengers,
+    fare_envelope,
     revision_impact,
     settle_balances,
     split_fares,
@@ -391,6 +392,139 @@ class RevisionImpactTests(unittest.TestCase):
     def test_unequal_lengths_rejected(self):
         with self.assertRaises(ValueError):
             revision_impact([1, 2], [1], [ride("a", 0, 2)])
+
+
+class FareEnvelopeTests(unittest.TestCase):
+    def test_hand_computed_target_on_both_open_segments(self):
+        # [x, 7, y] with x + y = 20; a rides all three segments, b rides
+        # segments 0-1. Hand computation: f_a(x) = ceil(x/2) + 3 + (x even)
+        # + (20 - x), so the minimum 14 is attained at x in {19, 20} (the
+        # lexicographically smallest witness, x=19, wins) and the maximum
+        # 24 at x=0. Note the minimum is NOT at an interval endpoint: the
+        # odd cent of segment 1 moves with the cross-segment deficit.
+        passengers = [ride("a", 0, 3), ride("b", 0, 2)]
+        result = fare_envelope([None, 7, None], [(0, 30), (0, 30)],
+                               passengers, 27, "a")
+        self.assertEqual(result, (14, [19, 7, 1], 24, [0, 7, 20]))
+
+    def test_hand_computed_target_on_one_open_segment(self):
+        # f_b(x) = floor(x/2) + 3 + (x odd): min 3 at x=0; max 13 attained
+        # at x in {19, 20} -> the witness is x=19, not the interval end.
+        passengers = [ride("a", 0, 3), ride("b", 0, 2)]
+        result = fare_envelope([None, 7, None], [(0, 30), (0, 30)],
+                               passengers, 27, "b")
+        self.assertEqual(result, (3, [0, 7, 20], 13, [19, 7, 1]))
+
+    def test_witnesses_reproduce_amounts_and_sum_to_total(self):
+        passengers = [ride("alice", 0, 3), ride("bob", 1, 3)]
+        min_amt, min_costs, max_amt, max_costs = fare_envelope(
+            [None, 251, None], [(0, 300), (0, 300)], passengers, 551, "alice"
+        )
+        self.assertEqual((min_amt, min_costs), (276, [0, 251, 300]))
+        self.assertEqual((max_amt, max_costs), (426, [300, 251, 0]))
+        for amount, costs in ((min_amt, min_costs), (max_amt, max_costs)):
+            self.assertEqual(sum(costs), 551)
+            totals, _ = split_fares(costs, passengers)
+            self.assertEqual(totals["alice"], amount)
+
+    def test_huge_interval_is_compressed_not_enumerated(self):
+        # Bounds 10^12 wide: the remainder period (lcm(2, 1) = 2 here)
+        # collapses the search to two 2-wide windows; this returns instantly
+        # instead of walking the interval cent by cent.
+        passengers = [ride("a", 0, 3), ride("b", 0, 2)]
+        result = fare_envelope([None, 7, None], [(0, 10**12), (0, 10**12)],
+                               passengers, 7 + 10**12, "a")
+        self.assertEqual(result, (5 * 10**11 + 4, [10**12 - 1, 7, 1],
+                                  10**12 + 4, [0, 7, 10**12]))
+
+    def test_full_remainder_period_with_12_passengers(self):
+        # n_u = 11 and n_v = 12 give the maximal remainder period
+        # lcm(11, 12) = 132; the 291-wide interval still collapses to two
+        # windows of <= 132 candidates each. Checked against brute force.
+        passengers = [ride(f"p{i}", 0, 4) for i in range(11)]
+        passengers.append(ride("late", 2, 4))  # on segment 3 but not 1
+        segments = [50, None, 30, None]
+        bounds = [(10, 310), (0, 400)]
+        total = 80 + 200 + 100
+        for target in ("p0", "late"):
+            got = fare_envelope(segments, bounds, passengers, total, target)
+            self.assertEqual(
+                got, _brute_force_envelope(segments, bounds, passengers,
+                                           total, target),
+            )
+
+    def test_matches_brute_force_on_random_trips(self):
+        rng = random.Random(20260927)
+        for _ in range(250):
+            n_seg = rng.randint(2, 7)
+            passengers = [ride("anchor", 0, n_seg)]
+            for i in range(rng.randint(0, 5)):
+                b0 = rng.randint(0, n_seg - 1)
+                passengers.append(ride(f"p{i}", b0, rng.randint(b0 + 1, n_seg)))
+            u, v = sorted(rng.sample(range(n_seg), 2))
+            segments = [rng.randint(0, 300) for _ in range(n_seg)]
+            segments[u] = segments[v] = None
+            bounds = []
+            for _ in range(2):
+                lo_b = rng.randint(0, 150)
+                bounds.append((lo_b, lo_b + rng.randint(0, 200)))
+            fixed = sum(c for c in segments if c is not None)
+            total = fixed + rng.randint(*bounds[0]) + rng.randint(*bounds[1])
+            target = rng.choice(passengers).id
+
+            got = fare_envelope(segments, bounds, passengers, total, target)
+            self.assertEqual(
+                got,
+                _brute_force_envelope(segments, bounds, passengers, total, target),
+                (segments, bounds, total, target),
+            )
+
+    def test_infeasible_total_is_rejected(self):
+        # the two open segments must sum to 20 but the bounds cap them at 10
+        with self.assertRaises(ValueError):
+            fare_envelope([None, 7, None], [(0, 5), (0, 5)],
+                          [ride("a", 0, 3)], 27, "a")
+
+    def test_not_exactly_two_blanks_is_rejected(self):
+        with self.assertRaises(ValueError):
+            fare_envelope([None, 7, 8], [(0, 5), (0, 5)],
+                          [ride("a", 0, 3)], 20, "a")
+
+    def test_unknown_target_is_rejected(self):
+        with self.assertRaises(ValueError):
+            fare_envelope([None, 7, None], [(0, 30), (0, 30)],
+                          [ride("a", 0, 3)], 27, "ghost")
+
+    def test_integer_target_matches_integer_id(self):
+        passengers = [ride(1, 0, 3), ride(2, 0, 2)]
+        min_amt, _, max_amt, _ = fare_envelope(
+            [None, 7, None], [(0, 30), (0, 30)], passengers, 27, 1
+        )
+        self.assertEqual((min_amt, max_amt), (14, 24))
+
+
+def _brute_force_envelope(segments, bounds, passengers, total_cost, target_id):
+    """Exact fare envelope by enumerating every feasible completion.
+
+    Test reference only: scans the whole feasible interval cent by cent
+    (ascending, so ties keep the lexicographically smallest cost vector).
+    """
+    u, v = [i for i, c in enumerate(segments) if c is None]
+    residual = total_cost - sum(c for c in segments if c is not None)
+    lo = max(bounds[0][0], residual - bounds[1][1])
+    hi = min(bounds[0][1], residual - bounds[1][0])
+    best_min = best_max = None
+    for x in range(lo, hi + 1):
+        costs = list(segments)
+        costs[u] = x
+        costs[v] = residual - x
+        totals, _ = split_fares(costs, passengers)
+        value = totals[target_id]
+        if best_min is None or value < best_min[0]:
+            best_min = (value, costs)
+        if best_max is None or value > best_max[0]:
+            best_max = (value, costs)
+    return best_min[0], best_min[1], best_max[0], best_max[1]
 
 
 class SettleBalancesTests(unittest.TestCase):

@@ -362,6 +362,132 @@ def revision_impact(original_costs: List[int], revised_costs: List[int],
     return before, after, changes
 
 
+# --- fare envelope: one passenger's payable range over two open segment fares
+
+
+def fare_envelope(segments, bounds, passengers, total_cost, target_id):
+    """Exact min/max of one passenger's split total over two open fares.
+
+    ``segments`` is the trip's cost list in travel order with exactly two
+    ``None`` entries (the undetermined segments); ``bounds`` holds one
+    inclusive ``(min, max)`` integer-cents pair per undetermined segment,
+    in segment order. A *completion* fills the two blanks with integer
+    cents inside their bounds so that all costs sum to ``total_cost``;
+    every completion is split with the same cumulative-deficit rule as
+    :func:`split_fares`. Returns ``(min_amount, min_costs, max_amount,
+    max_costs)``: the target passenger's exact payable extremes and, for
+    each, a complete witnessing cost vector — the lexicographically
+    smallest vector when several completions attain the same extreme.
+
+    Completions are never enumerated cent by cent. With ``u < v`` the open
+    positions and ``S = total_cost - sum(fixed)``, the totals constraint
+    forces the second open fare to ``S - x`` when the first is ``x``, so a
+    single integer variable ``x`` ranges over ``[lo, hi]`` (the bounds plus
+    the totals constraint). The deficit state driving the leftover-cent
+    allocation evolves only through the per-segment *remainders*
+    ``cost % n``: each segment's equal base cancels between the
+    theoretical share and the allocated amount. The whole remainder
+    sequence — hence every deficit comparison and every leftover-cent
+    assignment, cross-segment deficit carry included — is periodic in
+    ``x`` with period ``P = lcm(n_u, n_v)``, where ``n_u``/``n_v`` are the
+    on-board counts of the two open segments (at most 12 passengers, so
+    ``P <= 132``). The target's payable amount is therefore::
+
+        f(x) = k * x + g(x mod P) + const,
+        k = [target on u] / n_u - [target on v] / n_v,
+
+    because only the two open segments' equal bases are non-periodic. For
+    ``k > 0`` the minimum lies in the first period window and the maximum
+    in the last one (conversely for ``k < 0``; for ``k == 0`` the amount
+    is purely periodic). Scanning those two windows — at most ``2P``
+    candidates, however wide ``[lo, hi]`` is — yields the exact extremes;
+    scanning each window in ascending ``x`` keeps the smallest ``x`` on
+    ties, and since ``u`` is the first position where two completions
+    differ, the smallest ``x`` is the lexicographically smallest witness.
+    """
+    blanks = [i for i, cost in enumerate(segments) if cost is None]
+    if len(blanks) != 2:
+        raise ValueError(
+            f"exactly two undetermined (None) segments are required, "
+            f"found {len(blanks)}"
+        )
+    u, v = blanks
+    (lo_u, hi_u), (lo_v, hi_v) = bounds
+
+    residual = total_cost - sum(c for c in segments if c is not None)
+    lo = max(lo_u, residual - hi_v)
+    hi = min(hi_u, residual - lo_v)
+    if lo > hi:
+        raise ValueError(
+            f"no feasible cost combination: the two undetermined segments "
+            f"must sum to {residual} cents, which the bounds "
+            f"[{lo_u}, {hi_u}] and [{lo_v}, {hi_v}] cannot reach"
+        )
+
+    onboard = [
+        [p.id for p in passengers if p.board <= i < p.alight]
+        for i in range(len(segments))
+    ]
+    n_u, n_v = len(onboard[u]), len(onboard[v])
+    if n_u == 0 or n_v == 0:
+        raise ValueError(
+            "undetermined segments must carry at least one passenger"
+        )
+    target = next(
+        (p.id for p in passengers if str(p.id) == str(target_id)), None
+    )
+    if target is None:
+        raise ValueError(f"unknown target passenger id: {target_id!r}")
+
+    # f(x + P) = f(x) + k*P (see docstring); `trend` is k scaled by
+    # n_u * n_v, so its sign decides which period window holds each extreme.
+    period = n_u * n_v // _gcd(n_u, n_v)
+    trend = (target in onboard[u]) * n_v - (target in onboard[v]) * n_u
+
+    values = {}
+
+    def payable(x: int) -> int:
+        """Target's split total when the open fares are x and residual-x."""
+        if x not in values:
+            costs = list(segments)
+            costs[u] = x
+            costs[v] = residual - x
+            totals, _ = split_fares(costs, passengers)
+            values[x] = totals[target]
+        return values[x]
+
+    head = range(lo, min(hi, lo + period - 1) + 1)
+    tail = range(max(lo, hi - period + 1), hi + 1)
+
+    def arg_extreme(candidates, minimize: bool):
+        """First (smallest-x) minimizer/maximizer of ``payable``, in order."""
+        best_x = best_val = None
+        for x in candidates:
+            value = payable(x)
+            if best_val is None or (value < best_val if minimize
+                                    else value > best_val):
+                best_x, best_val = x, value
+        return best_x, best_val
+
+    if trend > 0:
+        min_x, min_amount = arg_extreme(head, minimize=True)
+        max_x, max_amount = arg_extreme(tail, minimize=False)
+    elif trend < 0:
+        min_x, min_amount = arg_extreme(tail, minimize=True)
+        max_x, max_amount = arg_extreme(head, minimize=False)
+    else:
+        min_x, min_amount = arg_extreme(head, minimize=True)
+        max_x, max_amount = arg_extreme(head, minimize=False)
+
+    def witness(x: int) -> List[int]:
+        costs = list(segments)
+        costs[u] = x
+        costs[v] = residual - x
+        return costs
+
+    return min_amount, witness(min_x), max_amount, witness(max_x)
+
+
 # --- settlement: turn balances (paid - owed) into a minimal set of transfers
 
 

@@ -7,6 +7,9 @@ from fastapi import FastAPI
 from .models import (
     AdmitRequest,
     AdmitResponse,
+    FareEnvelopeRequest,
+    FareEnvelopeResponse,
+    FareEnvelopeWitness,
     RevisionImpactRequest,
     RevisionImpactResponse,
     SegmentContribution,
@@ -19,6 +22,7 @@ from .models import (
 )
 from .splitter import (
     admit_passengers,
+    fare_envelope as compute_fare_envelope,
     revision_impact as compute_revision_impact,
     settle_balances,
     split_fares,
@@ -26,7 +30,7 @@ from .splitter import (
 
 app = FastAPI(
     title="Carpool Fare Splitter",
-    version="1.0.0",
+    version="1.1.0",
     summary="Split a carpool trip's per-segment costs fairly between passengers.",
 )
 
@@ -118,6 +122,33 @@ def admit(request: AdmitRequest) -> AdmitResponse:
             )
             for d in details
         ],
+    )
+
+
+@app.post(
+    "/fare-envelope",
+    response_model=FareEnvelopeResponse,
+    responses={422: {"description": "Invalid trip or request (bad interval, "
+                                     "out-of-range station, duplicate id, "
+                                     "empty-load charged segment, not exactly "
+                                     "two undetermined segments, undetermined "
+                                     "segment with nobody on board, malformed "
+                                     "bounds, unknown target, or no feasible "
+                                     "combination reaching the total, ...)"}},
+)
+def fare_envelope(request: FareEnvelopeRequest) -> FareEnvelopeResponse:
+    min_amount, min_costs, max_amount, max_costs = compute_fare_envelope(
+        request.segments,
+        [(bound.min, bound.max) for bound in request.bounds],
+        request.passengers,
+        request.total_cost,
+        request.target,
+    )
+    return FareEnvelopeResponse(
+        target=request.target,
+        total_cost=request.total_cost,
+        minimum=FareEnvelopeWitness(amount=min_amount, segments=min_costs),
+        maximum=FareEnvelopeWitness(amount=max_amount, segments=max_costs),
     )
 
 

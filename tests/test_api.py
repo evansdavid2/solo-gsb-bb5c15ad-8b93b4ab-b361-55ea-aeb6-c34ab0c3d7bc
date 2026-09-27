@@ -488,6 +488,178 @@ class SettleApiTests(unittest.TestCase):
         self.assertEqual(resp.json(), {"status": "ok"})
 
 
+class FareEnvelopeApiTests(unittest.TestCase):
+    ENVELOPE_PAYLOAD = {
+        "segments": [None, 7, None],
+        "bounds": [{"min": 0, "max": 30}, {"min": 0, "max": 30}],
+        "total_cost": 27,
+        "target": "a",
+        "passengers": [
+            {"id": "a", "board": 0, "alight": 3},
+            {"id": "b", "board": 0, "alight": 2},
+        ],
+    }
+
+    def test_envelope_ok(self):
+        resp = client.post("/fare-envelope", json=self.ENVELOPE_PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["target"], "a")
+        self.assertEqual(body["total_cost"], 27)
+        self.assertEqual(body["minimum"], {"amount": 14, "segments": [19, 7, 1]})
+        self.assertEqual(body["maximum"], {"amount": 24, "segments": [0, 7, 20]})
+
+    def test_envelope_other_target(self):
+        payload = dict(self.ENVELOPE_PAYLOAD, target="b")
+        body = client.post("/fare-envelope", json=payload).json()
+        # tie at the maximum (x in {19, 20}): the lexicographically smallest
+        # cost vector wins, so the witness is x=19, not the interval end 20
+        self.assertEqual(body["minimum"], {"amount": 3, "segments": [0, 7, 20]})
+        self.assertEqual(body["maximum"], {"amount": 13, "segments": [19, 7, 1]})
+
+    def test_witnesses_are_valid_completions_matching_split(self):
+        body = client.post("/fare-envelope", json=self.ENVELOPE_PAYLOAD).json()
+        for key in ("minimum", "maximum"):
+            witness = body[key]["segments"]
+            self.assertEqual(sum(witness), body["total_cost"])
+            # fixed segment untouched, bounds respected
+            self.assertEqual(witness[1], 7)
+            self.assertTrue(0 <= witness[0] <= 30)
+            self.assertTrue(0 <= witness[2] <= 30)
+            # the reported amount is exactly what /split yields for it
+            split = client.post("/split", json={
+                "segments": witness,
+                "passengers": self.ENVELOPE_PAYLOAD["passengers"],
+            }).json()
+            self.assertEqual(split["totals"]["a"], body[key]["amount"])
+
+    def test_huge_bounds_return_instantly(self):
+        # 10^12-wide bounds: the remainder-period compression answers without
+        # enumerating the interval cent by cent.
+        payload = dict(
+            self.ENVELOPE_PAYLOAD,
+            bounds=[{"min": 0, "max": 10**12}, {"min": 0, "max": 10**12}],
+            total_cost=7 + 10**12,
+        )
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["minimum"],
+                         {"amount": 500000000004, "segments": [999999999999, 7, 1]})
+        self.assertEqual(body["maximum"],
+                         {"amount": 1000000000004, "segments": [0, 7, 1000000000000]})
+
+    def test_integer_target_id(self):
+        payload = dict(self.ENVELOPE_PAYLOAD, target=1, passengers=[
+            {"id": 1, "board": 0, "alight": 3},
+            {"id": 2, "board": 0, "alight": 2},
+        ])
+        body = client.post("/fare-envelope", json=payload).json()
+        self.assertEqual(body["target"], 1)
+        self.assertEqual(body["minimum"]["amount"], 14)
+        self.assertEqual(body["maximum"]["amount"], 24)
+
+    def test_input_order_does_not_matter(self):
+        import random
+        baseline = client.post("/fare-envelope", json=self.ENVELOPE_PAYLOAD).json()
+        for seed in range(5):
+            shuffled = dict(self.ENVELOPE_PAYLOAD,
+                            passengers=self.ENVELOPE_PAYLOAD["passengers"][:])
+            random.Random(seed).shuffle(shuffled["passengers"])
+            resp = client.post("/fare-envelope", json=shuffled)
+            self.assertEqual(resp.status_code, 200, resp.text)
+            self.assertEqual(resp.json(), baseline)
+
+    def test_not_exactly_two_nulls_is_422(self):
+        for segments in ([7, 7, 7], [None, 7, 7], [None, None, None]):
+            payload = dict(self.ENVELOPE_PAYLOAD, segments=segments)
+            resp = client.post("/fare-envelope", json=payload)
+            self.assertEqual(resp.status_code, 422, segments)
+            self.assertIn("exactly two", resp.text)
+
+    def test_bounds_must_be_two_ordered_pairs(self):
+        for bounds in (
+            [{"min": 0, "max": 30}],  # only one pair
+            [{"min": 0, "max": 30}] * 3,  # three pairs
+            [{"min": 20, "max": 10}, {"min": 0, "max": 30}],  # min > max
+            [{"min": -1, "max": 30}, {"min": 0, "max": 30}],  # negative bound
+        ):
+            payload = dict(self.ENVELOPE_PAYLOAD, bounds=bounds)
+            self.assertEqual(
+                client.post("/fare-envelope", json=payload).status_code, 422, bounds
+            )
+
+    def test_unknown_target_is_422(self):
+        payload = dict(self.ENVELOPE_PAYLOAD, target="ghost")
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("unknown target", resp.text)
+
+    def test_undetermined_segment_without_passengers_is_422(self):
+        # nobody rides segments 0 and 2, which are the undetermined ones
+        payload = dict(self.ENVELOPE_PAYLOAD,
+                       passengers=[{"id": "a", "board": 1, "alight": 2}])
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no passengers on board", resp.text)
+
+    def test_fixed_empty_load_charged_segment_is_422(self):
+        # the fixed middle segment (cost 7) has nobody on board
+        payload = dict(self.ENVELOPE_PAYLOAD, passengers=[
+            {"id": "a", "board": 0, "alight": 1},
+            {"id": "b", "board": 2, "alight": 3},
+        ])
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no passengers on board", resp.text)
+
+    def test_infeasible_total_is_422(self):
+        # the two open segments must sum to 20 but the bounds cap them at 10
+        payload = dict(self.ENVELOPE_PAYLOAD,
+                       bounds=[{"min": 0, "max": 5}, {"min": 0, "max": 5}])
+        resp = client.post("/fare-envelope", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no feasible cost combination", resp.text)
+
+    def test_trip_rule_violations_are_422(self):
+        dup = dict(self.ENVELOPE_PAYLOAD, passengers=[
+            {"id": "a", "board": 0, "alight": 3},
+            {"id": "a", "board": 0, "alight": 2},
+        ])
+        resp = client.post("/fare-envelope", json=dup)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("duplicate passenger id", resp.text)
+
+        bad_interval = dict(self.ENVELOPE_PAYLOAD, passengers=[
+            {"id": "a", "board": 2, "alight": 2},
+        ])
+        self.assertEqual(
+            client.post("/fare-envelope", json=bad_interval).status_code, 422
+        )
+
+        out_of_range = dict(self.ENVELOPE_PAYLOAD, passengers=[
+            {"id": "a", "board": 0, "alight": 9},
+        ])
+        self.assertEqual(
+            client.post("/fare-envelope", json=out_of_range).status_code, 422
+        )
+
+    def test_malformed_requests_are_422(self):
+        base = self.ENVELOPE_PAYLOAD
+        cases = [
+            dict(base, total_cost=-1),  # negative total
+            dict(base, segments=[None, -5, None]),  # negative fixed cost
+            dict(base, unknown_field=True),  # extra field
+            {k: v for k, v in base.items() if k != "bounds"},  # missing bounds
+            {k: v for k, v in base.items() if k != "total_cost"},
+            {k: v for k, v in base.items() if k != "target"},
+        ]
+        for payload in cases:
+            self.assertEqual(
+                client.post("/fare-envelope", json=payload).status_code, 422, payload
+            )
+
+
 class RevisionImpactApiTests(unittest.TestCase):
     REVISION_PAYLOAD = {
         "segments": [100, 251, 80],
